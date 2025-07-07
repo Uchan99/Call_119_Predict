@@ -24,31 +24,54 @@
 
 ## 🧼 2. 데이터 전처리 및 정제
 
-- 불필요한 컬럼 제거: `tm_dt`, `address_city`
-- 누락된 날짜-동 조합은 **call_count = 0**으로 채움
-- 외부 데이터는 날짜/행정동 단위 기준으로 병합 및 정제
-- 모든 날짜는 `datetime` 변환 후 정렬
+### ✅ 기본 처리
+```python
+df = pd.read_csv('2020_2023_최종데이터.csv')
+df.drop(columns=['tm_dt', 'address_city'], inplace=True)
+df['datetime'] = pd.to_datetime(df['tm'], format='%Y%m%d')
+```
+- 불필요한 컬럼 제거 (tm_dt, address_city)
+- 날짜 컬럼을 datetime 포맷으로 변환
+
+### ✅ 누락된 날짜-동 조합 처리
+```python
+# 모든 날짜-행정동 조합 생성 후 병합
+full_index = pd.MultiIndex.from_product([...])
+df = full_df.merge(df, on=['tm', 'address_gu', 'sub_address'], how='left')
+df['call_count'] = df['call_count'].fillna(0)
+```
+- 존재하지 않는 날짜-행정동 조합은 신고 건수 0으로 채움
 
 ---
 
 ## 🧠 3. 피처 엔지니어링
 
-### ✅ 시간 기반 피처
-- `day`, `weekday`, `day_of_year`, `is_weekend`
-- `month_sin`, `month_cos` (계절성 보완)
-- 공휴일 전후 여부: `is_before_holiday`, `is_after_holiday`
+### ✅ 시간 기반 피처 생성
+```python
+df['day'] = df['datetime'].dt.day
+df['weekday'] = df['datetime'].dt.weekday
+df['is_weekend'] = df['weekday'].isin([5, 6]).astype(int)
+df['month_sin'] = np.sin(2 * np.pi * df['datetime'].dt.month / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['datetime'].dt.month / 12)
+```
+- 주기적 특성(월, 요일)을 sin/cos으로 인코딩
+- 주말 여부, 공휴일 전후 여부도 파생
 
 ### ✅ 시계열 기반 피처
-- `dong_lag_1`, `dong_lag_7`
-- `dong_rolling_mean_7`, `dong_rolling_std_7`
-- `days_since_last_call_dong`
+```python
+df['dong_lag_1'] = df.groupby(['address_gu', 'sub_address'])['call_count'].shift(1)
+df['dong_rolling_mean_7'] = df.groupby(['address_gu', 'sub_address'])['call_count'].shift(1).rolling(window=7).mean()
+```
+- 신고 건수의 최근 1일, 7일 평균, 표준편차 등 생성
+- 해당 동 기준의 시계열 특성을 모델에 반영
 
 ### ✅ 타겟 인코딩
-- `address_gu`, `sub_address` 기준으로 **과거 평균 call_count**를 매핑하여 지역별 경향성 보강
-
-### ✅ 피처 선택
-- `call_count`와 **상관계수 ≤ 0.02**인 피처는 제거  
-→ 모델의 과적합 방지 및 성능 개선
+```python
+gu_mean_map = y_train.groupby(X_train_full['address_gu']).mean()
+X_train_full['address_gu_mean_target'] = X_train_full['address_gu'].map(gu_mean_map)
+```
+- 행정구별 평균 신고 건수를 파생 변수로 생성
+- 지역별 수요 차이를 모델이 학습 가능하도록 보완
 
 ---
 
@@ -56,51 +79,54 @@
 
 - 시계열 특성을 고려하여 **시간 순서 기준으로 80:20 분할**
 ```python
-train_test_split(..., test_size=0.2, shuffle=False)
+X_train, X_val, y_train, y_val = train_test_split(..., test_size=0.2, shuffle=False)
 ```
 - 검증 데이터는 약 2023년 초~말 구간의 데이터를 포함
 - 학습 및 검증셋은 시간 순서 기반으로 나누어 누수 방지
 
 ## 🤖 5. 모델 구성 및 학습 방식
 
-### ✅ 모델 프레임워크
-
-- XGBRegressor (XGBoost 회귀 모델)
-
-### ✅ 구 단위 모델 학습 구조
-
+✅ XGBoost 회귀 모델
 ```python
-for gu in gu_list:
+model = XGBRegressor(
+    n_estimators=1000,
+    learning_rate=0.05,
+    max_depth=6,
+    tree_method='hist',
+    early_stopping_rounds=30,
+)
+```
+- 비선형성에 강한 XGBoost 회귀 모델 활용
+- 학습은 전체 데이터로, 검증은 지역별로 따로 수행
+
+### ✅ 구 단위 모델 학습
+```python
+for gu in gu_train.unique():
     model = XGBRegressor(**params)
     model.fit(X_train, y_train, eval_set=[(X_val_gu, y_val_gu)])
 ```
-- 부산시의 각 행정구(address_gu) 단위로 개별 모델을 따로 학습
-- 학습은 전체 데이터로, 검증은 해당 구의 검증 데이터로만 수행
-→ 지역별 특성 반영 효과 ↑
+- 각 행정구(address_gu) 단위로 개별 모델을 따로 학습
+- 특정 지역에 맞는 패턴을 개별적으로 반영할 수 있음
 
-### ✅ Optuna 기반 자동 튜닝
-
+### ✅ Optuna 기반 하이퍼파라미터 튜닝
 ```python
 def objective(trial, ...):
     params = {
-        'max_depth': trial.suggest_int(5, 12),
-        'learning_rate': trial.suggest_float(0.01, 0.2, log=True),
+        'max_depth': trial.suggest_int('max_depth', 5, 12),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
         ...
     }
-    return RMSE
 ```
-- Optuna로 하이퍼파라미터 최적화 수행
-- Validation RMSE를 최소화하는 파라미터 탐색
-- 탐색 범위: max_depth, learning_rate, gamma, lambda, alpha 등
+- Optuna 라이브러리를 통해 자동으로 최적 파라미터 탐색
+- 평가 기준은 Validation RMSE 최소화
 
 ### ✅ 예측 보정
-
 ```python
 scaled_pred = pred * 0.8
 clipped_pred = np.clip(scaled_pred, 1, 6)
 final_pred = round(clipped_pred)
 ```
-- 과대 예측 방지를 위해 스케일 조정(0.8) 및 클리핑(1~6) 후 반올림
+- 과대 예측 방지를 위해 예측값을 스케일 조정 후 클리핑
 
 ## 📈 6. 성능 평가
 
